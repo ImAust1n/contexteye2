@@ -71,9 +71,9 @@ def classify_hazards(
     if wall_data and wall_data.get("ahead"):
         suggestion = "Stop"
         if wall_data.get("left_clear"):
-            suggestion = "Move left"
+            suggestion = "Steer left"
         elif wall_data.get("right_clear"):
-            suggestion = "Move right"
+            suggestion = "Steer right"
 
         hazards.append({
             "source":   "SCENE",
@@ -81,7 +81,9 @@ def classify_hazards(
             "priority": HIGH,
             "details":  {
                 "message": "Large obstacle blocking forward path",
-                "suggestion": suggestion
+                "suggestion": suggestion,
+                "left_clear": wall_data.get("left_clear", False),
+                "right_clear": wall_data.get("right_clear", False)
             },
         })
 
@@ -103,12 +105,24 @@ def classify_hazards(
         pos    = obj["position"]              # LEFT | CENTER | RIGHT
 
         priority = _classify_object_priority(label, zone, motion, pos)
+        
+        # DIRECTIONAL ADVICE: If object is in center and within sight (NEAR/MID),
+        # attach a move suggestion based on side path clearance.
+        suggestion = None
+        if pos == "CENTER" and zone in ["NEAR", "MID"]:
+            if wall_data:
+                if wall_data.get("left_clear"):
+                    suggestion = "Steer left"
+                elif wall_data.get("right_clear"):
+                    suggestion = "Steer right"
+                else:
+                    suggestion = "Stop"
 
         hazards.append({
             "source":   "DETECTION",
             "label":    label,
             "priority": priority,
-            "details":  obj,
+            "details":  {**obj, "suggestion": suggestion},
         })
 
     # ── Sort: HIGH first, then MEDIUM, then LOW ───────────────────────────────

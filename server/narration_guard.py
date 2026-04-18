@@ -1,28 +1,34 @@
 import re
 
 def select_primary_hazard(hazards: list) -> dict:
-    """
-    Selects the single most critical hazard from the list.
-    Rules:
-    - Choose HIGH priority first.
-    - If multiple, choose the closest or most central one.
-    """
-    if not hazards:
-        return None
-    
-    # hazards are already sorted by priority from hazard.py
-    # We just take the first one, but could add distance-based tie-breaking here
+    """Selects the single most critical hazard."""
+    if not hazards: return None
     return hazards[0]
+
+def select_top_hazards(hazards: list, limit: int = 3) -> list:
+    """
+    Selects the top N most critical hazards.
+    Hazards are already sorted by priority (HIGH > MEDIUM > LOW).
+    """
+    if not hazards: return []
+    return hazards[:limit]
 
 def clean_text(text: str) -> str:
     """
-    Strips noise, formatting, and repeated phrases.
+    Strips noise, formatting, filler words, and repeated phrases.
     """
     # Remove bullet points and weird newlines
     text = text.replace("- ", "").replace("\n", " ").strip()
     
-    # Remove technical tags like [FAST] or [HIGH] if the LLM leaked them
+    # Remove technical tags
     text = re.sub(r"\[.*?\]", "", text)
+    
+    # SYLLABLE STRIPPING: Remove words that add delay but no value
+    fillers = ["gently", "smoothly", "immediately", "currently", "really", "quickly", "slowly", "very"]
+    for word in fillers:
+        text = re.sub(rf"(?i)\b{word}\b", "", text)
+        
+    text = re.sub(r"\s+", " ", text).strip()
     
     # Simple phrase-based deduplication
     words = text.split()
@@ -32,7 +38,7 @@ def clean_text(text: str) -> str:
             seen.append(w)
     clean = " ".join(seen)
     
-    # Remove repeated neighboring sentences (e.g. "Path clear. Path clear.")
+    # Remove repeated neighboring sentences
     sentences = [s.strip() for s in clean.split('.') if s.strip()]
     unique_sentences = []
     for s in sentences:
@@ -41,44 +47,59 @@ def clean_text(text: str) -> str:
             
     return ". ".join(unique_sentences) + "." if unique_sentences else ""
 
-def resolve_contradictions(text: str) -> str:
+def resolve_contradictions(text: str, hazards: list = None) -> str:
     """
-    Ensures safe guidance by removing 'Path clear' when hazards are present.
+    Ensures safe guidance by removing 'Path clear' when hazards are present,
+    UNLESS it specifies a directional opening.
+    Also replaces vague 'Adjust direction' with specific suggestions if available.
     """
-    has_obstacle = any(kw in text.lower() for kw in ["wall", "obstacle", "person", "chair", "stairs", "door"])
+    text_lower = text.lower()
+    has_obstacle = any(kw in text_lower for kw in ["wall", "obstacle", "person", "chair", "stairs", "door"])
     
+    # Grab the best suggestion from our hazard layer
+    primary = select_primary_hazard(hazards)
+    suggestion = primary.get("details", {}).get("suggestion") if primary else None
+
     if has_obstacle:
-        # If an obstacle is detected, "Path clear" is a dangerous contradiction.
-        # Replace it with actionable guidance.
-        if "path clear" in text.lower():
-            text = re.sub(r"(?i)path clear\.?", "Adjust direction.", text)
+        # 1. Fix "Path clear" contradictions
+        if "path clear" in text_lower:
+            if not re.search(r"path clear (on|to|towards) (the )?(left|right)", text_lower):
+                text = re.sub(r"(?i)path clear\.?", suggestion if suggestion else "Steer around.", text)
+        
+        # 2. Fix vague "Adjust direction"
+        if "adjust direction" in text_lower and suggestion:
+            text = text.replace("Adjust direction", suggestion)
             
     return text
 
-def enforce_structure(text: str) -> str:
+def enforce_structure(text: str, hazards: list = None) -> str:
     """
     Normalizes output to '[Objective]. [Action].' format.
+    Uses hazard data to ensure specific directional guidance is matched.
     """
     sentences = [s.strip() for s in text.split('.') if s.strip()]
     
     if not sentences:
-        return "Path clear."
+        return ""
     
-    # If we only have one sentence, it might be just the object.
-    # We try to ensure there's at least a simple instruction.
-    if len(sentences) == 1:
-        if "move" not in text.lower() and "stop" not in text.lower() and "turn" not in text.lower():
-            # If no action mentioned, append a generic one based on context
-            if "wall" in text.lower() or "stairs" in text.lower():
-                return f"{sentences[0]}. Stop or turn."
-            else:
-                return f"{sentences[0]}. Use caution."
+    # If we only have one sentence, inject specific directional guidance.
+    text_lower = text.lower()
+    if not any(kw in text_lower for kw in ["move", "stop", "turn", "steer", "veer", "bypass", "path clear", "adjust"]):
+        primary = select_primary_hazard(hazards)
+        suggestion = primary.get("details", {}).get("suggestion") if primary else None
+        
+        if suggestion:
+            return f"{sentences[0]}. {suggestion}."
+        elif "wall" in text_lower or "stairs" in text_lower:
+            return f"{sentences[0]}. Stop or turn."
+        else:
+            return f"{sentences[0]}. Use caution."
                 
     return text
 
-def limit_length(text: str, max_sentences=2, max_words_per_sentence=15) -> str:
+def limit_length(text: str, max_sentences=1, max_words_per_sentence=12) -> str:
     """
-    Hard-caps length to ensure speed and clarity.
+    Hard-caps length to telegraphic style for speed.
     """
     sentences = [s.strip() for s in text.split('.') if s.strip()]
     final_sentences = []
@@ -117,8 +138,8 @@ def process_narration(raw_text: str, hazards: list) -> str:
         return "" # Skip broken outputs
         
     text = clean_text(raw_text)
-    text = resolve_contradictions(text)
-    text = enforce_structure(text)
+    text = resolve_contradictions(text, hazards)
+    text = enforce_structure(text, hazards)
     text = limit_length(text)
     
     return text

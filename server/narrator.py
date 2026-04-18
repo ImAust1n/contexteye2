@@ -39,11 +39,11 @@ from server.narration_guard import (
 # Simplified system prompt for faster inference
 # Strictest possible instructions for brevity
 _SYSTEM_PROMPT = (
-    "Act as a navigation assistant for the blind. "
-    "Narrate ONLY the 1-2 most critical items from the SCENE. "
-    "Max 10 words. No full sentences. No chatter. Be blunt. "
-    "Example: 'Person approaching center. Wall ahead.' "
-    "If clear, say 'Path clear.'"
+    "Act as a professional high-speed navigation assistant. "
+    "MANDATORY: Speak every time you detect a change or periodically (2-3s). "
+    "If multiple objects are present, group them into ONE cohesive sentence. "
+    "Max 10-12 words. No filler. Examples: 'Person center, chair right. Steer left.' "
+    "Instruction last. Environmental check first."
 )
 
 
@@ -56,6 +56,15 @@ class Narrator:
     def __init__(self):
         self.last_narration: str = "Initialising..."
         self.last_priority:  str = "LOW"
+        self._last_spoken:   float = 0.0
+        self._is_running:    bool = False
+        
+        # State tracking for redundancy reduction
+        self._last_primary_hazard: str = "none"
+        self._last_primary_pos:    str = ""
+        self._last_primary_dist:   float = 0.0
+        self._last_fast_trigger:   float = 0.0
+        
         self._lock = threading.Lock()
 
         # State tracking
@@ -70,16 +79,18 @@ class Narrator:
             print("[Narrator] WARNING: Ollama not reachable. Will use rule-based fallback.")
 
     # ─────────────────────────────────────────────────────────────────────────
-    def update(self, hazards: list, wall_data: dict = None):
+    def update(self, hazards: list, wall_data: dict = None, timestamp: float = None):
         """
-        Called every frame with the current hazard list.
-        Decides whether to trigger a new narration based on priority and cooldown.
-
-        Args:
-            hazards:    sorted list from hazard.classify_hazards()
-            wall_data:  dict from SpatialAnalyzer.detect_wall_ahead()
+        Called every frame with the current hazard list and the frame's acquisition time.
         """
         if not hazards and not wall_data:
+            return
+        
+        now = time.time()
+        frame_time = timestamp or now
+        
+        # If the frame is ALREADY old (pipeline lag), don't even start an LLM call
+        if now - frame_time > 1.0:
             return
         
         wall_ahead = wall_data.get("ahead", False) if wall_data else False
@@ -88,50 +99,71 @@ class Narrator:
         primary = select_primary_hazard(hazards)
         primary_label = primary["label"] if primary else "clear"
         top_priority = primary["priority"] if primary else LOW
-
         # ── FAST PATH: Instant safety override ───────────────────────────────
         # If we have a HIGH hazard and Fast Path is enabled, update text immediately.
-        if LLM_FAST_PATH_ENABLED and top_priority == HIGH:
-            fast_text = self._rule_based_fallback(hazards, wall_data)
+        # Enforce a 3.0s cooldown to prevent firing too frequently.
+        if LLM_FAST_PATH_ENABLED and (hazards and hazards[0]["priority"] == HIGH):
             with self._lock:
-                # Update text but don't reset _last_spoken for the LLM context path
-                self.last_narration = "[FAST] " + fast_text
-                self.last_priority  = HIGH
+                now = time.time()
+                if (now - self._last_fast_trigger) > 3.0:
+                    fast_text = self._rule_based_fallback(hazards, wall_data)
+                    self.last_narration = "[FAST] " + fast_text
+                    self.last_priority  = HIGH
+                    self._last_fast_trigger = now
 
+        # Identify the primary concern
+        primary = select_primary_hazard(hazards)
+        primary_label = primary["label"] if primary else "none"
+        primary_pos   = primary.get("details", {}).get("position", "") if primary else ""
+        primary_dist  = primary.get("details", {}).get("distance_m", 0.0) if primary else 0.0
+        top_priority = hazards[0]["priority"] if hazards else LOW
+        
         with self._lock:
             now = time.time()
             elapsed = now - self._last_spoken
             
-            # Trigger Logic
-            is_new_info = (top_priority != LOW) or (primary_label != self._last_primary_hazard)
+            # REDUNDANCY FILTER (STRICT)
+            # Trigger ONLY if:
+            # 1. The hazard type changed (e.g. Wall -> Person)
+            # 2. Key positional data changed (e.g. Center -> Left)
+            # 3. Distance changed DRAMATICALLY (> 1.5m)
+            dist_diff = abs(primary_dist - self._last_primary_dist)
+            is_new_situ = (primary_label != self._last_primary_hazard) or \
+                          (primary_pos != self._last_primary_pos) or \
+                          (dist_diff > 1.5)
             
-            # HIGH/MEDIUM: Frequent updates + repeat if same (safety)
+            # HIGH/MEDIUM: Enforce silence unless situation is truly different or time passed
             if top_priority in [HIGH, MEDIUM]:
-                cooldown = 2.0 if top_priority == HIGH else 3.0
-                if not self._is_running and (elapsed >= cooldown or is_new_info):
-                    self._trigger_narration(hazards, wall_data, top_priority)
+                # HIGH: 2.5s repeated warning. MEDIUM: 5.0s pulse.
+                cooldown = 2.5 if top_priority == HIGH else 5.0
+                if not self._is_running and (elapsed >= cooldown or is_new_situ):
+                    self._trigger_narration(hazards, wall_data, top_priority, frame_time)
                     self._last_primary_hazard = primary_label
+                    self._last_primary_pos    = primary_pos
+                    self._last_primary_dist   = primary_dist
                 return
 
             # LOW: Informational; strictly deduplicate and respects cooldown
-            if not self._is_running and elapsed >= LLM_COOLDOWN_SEC and is_new_info:
-                self._trigger_narration(hazards, wall_data, top_priority)
+            if not self._is_running and (elapsed >= LLM_COOLDOWN_SEC and is_new_situ):
+                self._trigger_narration(hazards, wall_data, top_priority, frame_time)
                 self._last_primary_hazard = primary_label
+                self._last_primary_pos    = primary_pos
+                self._last_primary_dist   = primary_dist
 
     # ─────────────────────────────────────────────────────────────────────────
-    def _trigger_narration(self, hazards: list, wall_data: dict, priority: str):
+    def _trigger_narration(self, hazards: list, wall_data: dict, priority: str, frame_time: float):
         """Starts a background thread to call Ollama. Non-blocking."""
         self._is_running       = True
         self._pending_priority = priority
         thread = threading.Thread(
             target=self._run_llm,
-            args=(hazards, wall_data, priority),
+            args=(hazards, wall_data, priority, frame_time),
             daemon=True,
         )
         thread.start()
 
     # ─────────────────────────────────────────────────────────────────────────
-    def _run_llm(self, hazards: list, wall_data: dict, priority: str):
+    def _run_llm(self, hazards: list, wall_data: dict, priority: str, frame_time: float):
         """
         Background thread: builds prompt, calls Phi-3, stores result.
         Falls back to rule-based text if Ollama is unavailable.
@@ -145,6 +177,13 @@ class Narrator:
                 response_text = self._rule_based_fallback(hazards, wall_data)
 
             with self._lock:
+                # STALE CHECK: If generation took > 1.5s, the info is outdated.
+                latency = time.time() - frame_time
+                if latency > 1.5:
+                    print(f"[Narrator] Discarding stale {priority} narration (Late by {latency:.1f}s)")
+                    self._is_running = False
+                    return
+
                 # Apply Narration Guard (Cleaning, Contradictions, Length)
                 text = process_narration(response_text.strip(), hazards)
                 
@@ -173,28 +212,34 @@ class Narrator:
     # ─────────────────────────────────────────────────────────────────────────
     def _build_prompt(self, hazards: list, wall_data: dict) -> str:
         """
-        Converts the hazard list into a focused scene description for Phi-3.
-        Focuses on the PRIMARY hazard to ensure conciseness.
+        Converts top 3 hazards into a dense scene description for Phi-3.
         """
-        primary = select_primary_hazard(hazards)
-        if not primary and not (wall_data and wall_data.get("ahead")):
-            return f"SCENE: Path clear.\n\nNarrate this for a visually impaired navigator:"
+        from .narration_guard import select_top_hazards
+        top_hazards = select_top_hazards(hazards, limit=3)
+        
+        if not top_hazards and not (wall_data and wall_data.get("ahead")):
+            return "SCENE: Path clear. Requesting single-sentence status update."
 
         lines = []
-        if wall_data and wall_data.get("ahead"):
-            suggestion = wall_data.get("suggestion", "Stop or turn.")
-            lines.append(f"WALL blocking center path [HIGH]. Instruction: {suggestion}.")
-        
-        if primary:
-            label    = primary["label"]
-            priority = primary["priority"]
-            det      = primary.get("details", {})
+        if wall_data:
+            ahead = "BLOCKED" if wall_data.get("ahead") else "CLEAR"
+            left  = "CLEAR" if wall_data.get("left_clear") else "BLOCKED"
+            right = "CLEAR" if wall_data.get("right_clear") else "BLOCKED"
             
-            if primary["source"] == "DETECTION":
+            if wall_data.get("ahead"):
+                lines.append(f"MAP: Forward BLOCKED. Left {left}, Right {right}. SUGGESTION: {wall_data.get('suggestion', 'Stop')}.")
+            else:
+                lines.append(f"MAP: Forward CLEAR. Left {left}, Right {right}.")
+        
+        for h in top_hazards:
+            label    = h["label"]
+            priority = h["priority"]
+            det      = h.get("details", {})
+            
+            if h["source"] == "DETECTION":
                 pos    = det.get("position", "")
                 dist   = det.get("distance_m", "?")
-                motion = det.get("motion", "")
-                lines.append(f"{label.capitalize()} {dist}m {pos.lower()}, {motion.lower()} [{priority}].")
+                lines.append(f"{label} at {dist}m {pos.lower()} [{priority}].")
             else:
                 regions = det.get("regions", [])
                 region_str = ", ".join(r.lower() for r in regions) if regions else "ahead"
@@ -221,6 +266,7 @@ class Narrator:
             "options": {
                 "temperature": 0.0,    # 0.0 for maximum consistency
                 "num_predict": 25,     # Aggressively capped for short phrases
+                "num_ctx": 1024,       # Smaller context for low-latency
                 "num_thread": 8,
                 "top_k": 20,
                 "top_p": 0.9,
@@ -238,9 +284,12 @@ class Narrator:
     def _rule_based_fallback(self, hazards: list, wall_data: dict) -> str:
         """Simple rule-based narration when Ollama is unavailable."""
         raw = ""
+        primary = select_primary_hazard(hazards)
+        suggestion = primary.get("details", {}).get("suggestion") if primary else None
+        
         if wall_data and wall_data.get("ahead"):
-            suggestion = wall_data.get("suggestion", "Stop.")
-            raw = f"Wall ahead. {suggestion}"
+            wall_sugg = wall_data.get("suggestion", "Stop.")
+            raw = f"Wall ahead. {wall_sugg}"
         elif not hazards:
             raw = "Path clear."
         else:
@@ -248,8 +297,12 @@ class Narrator:
             label = top["label"]
             det   = top.get("details", {})
             pos   = det.get("position", "").lower()
-            if top["priority"] == HIGH:
-                raw = f"Warning: {label} {pos}. Stop."
+            
+            # Use the suggestion from the hazard layer if available instead of hardcoded Stop/Caution
+            if suggestion:
+                raw = f"{label.capitalize()} {pos}. {suggestion}."
+            elif top["priority"] == HIGH:
+                raw = f"Warning: {label} {pos}. Stop or turn."
             else:
                 raw = f"{label.capitalize()} {pos}. Caution."
         

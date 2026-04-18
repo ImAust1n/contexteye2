@@ -25,63 +25,13 @@ from server.segmentor import Segmentor
 from server.spatial   import SpatialAnalyzer
 from server.hazard    import classify_hazards
 from server.narrator  import Narrator
+from server.speaker   import LocalSpeaker
 
 # ──────────────────────────────────────────────
 # 3. Local TTS Engine
 # ──────────────────────────────────────────────
 
-class LocalSpeaker:
-    """
-    Handles local text-to-speech using pyttsx3 in a dedicated worker thread.
-    This prevents the engine from hanging or crashing on Windows (SAPI5).
-    """
-    def __init__(self):
-        self.queue = queue.Queue()
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-        print("[Speaker] Local TTS initialised with dedicated worker.")
-
-    def _worker(self):
-        """Dedicated thread for pyttsx3 processing."""
-        # MUST initialize COM for SAPI5 to work in a background thread
-        pythoncom.CoInitialize()
-        
-        try:
-            print("[Speaker] SAPI5 Worker Thread started.")
-            
-            while True:
-                text = self.queue.get()
-                if text is None: break
-                
-                # Clean text from technical tags
-                clean_text = text.replace("[FAST]", "").strip()
-                
-                print(f"[Speaker] Speaking: {clean_text[:40]}...")
-                try:
-                    # RE-INIT engine every time to ensure fresh state on Windows
-                    engine = pyttsx3.init()
-                    engine.setProperty('rate', 190) 
-                    engine.setProperty('volume', 1.0)
-                    
-                    engine.say(clean_text)
-                    engine.runAndWait()
-                    
-                    # Explicitly stop to clear buffers
-                    engine.stop()
-                    del engine  # Force cleanup
-                except Exception as e:
-                    print(f"[Speaker] Engine error: {e}")
-                finally:
-                    self.queue.task_done()
-        except Exception as e:
-            print(f"[Speaker] Thread critical error: {e}")
-        finally:
-            pythoncom.CoUninitialize()
-
-    def speak(self, text):
-        """Add text to the speech queue (Non-blocking)."""
-        if not text: return
-        self.queue.put(text)
+# Shared LocalSpeaker imported from server.speaker
 
 # ──────────────────────────────────────────────
 # 4. Visualization Helpers
@@ -176,9 +126,8 @@ def main():
             if not paused:
                 ret, frame = cap.read()
                 if not ret:
-                    # Loop video
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
+                    print("🎬 Video finished.")
+                    break
                 
                 frame_idx += 1
                 
@@ -186,6 +135,7 @@ def main():
                 proc_frame = cv2.resize(frame, (640, 640))
                 
                 # 2. Run Perception (on every frame we read in this mode)
+                loop_timestamp = time.time()
                 dets        = detector.detect(proc_frame)
                 depth_map   = depth_est.get_depth_map(proc_frame)
                 seg_results = segmentor.segment(proc_frame)
@@ -195,30 +145,37 @@ def main():
                 hazards    = classify_hazards(spatial, wall_data=wall_data, seg_results=seg_results)
                 
                 # Update the narrator (LLM background call)
-                narrator.update(hazards, wall_data=wall_data)
+                narrator.update(hazards, wall_data=wall_data, timestamp=loop_timestamp)
 
-                # 3. Intelligent Narration / Speaking Logic
+                # 3. Intelligent Narration / Speaking Logic (Immediate Response)
                 current_text     = narrator.last_narration
                 current_priority = narrator.last_priority
                 now              = time.time()
                 time_since_speech = now - last_spoken_time
                 
-                should_speak = False
+                is_urgent   = current_priority in ["HIGH", "MEDIUM"]
+                has_changed = (current_text != last_spoken_text)
                 
-                # Logic: Keep speaking warnings (HIGH/MEDIUM) every 2.5s even if text is same
-                if current_priority in ["HIGH", "MEDIUM"]:
-                    if time_since_speech >= 2.5:
-                        should_speak = True
-                # Logic: Informational items (LOW) speak once and wait 4s for next different item
+                # REPETITION SHIELD (Consistent 2-3s Pacing)
+                # MEDIUM/LOW: 3.0s steady pulse
+                if current_priority == "HIGH":
+                    cooldown = 2.0
                 else:
-                    if current_text != last_spoken_text and time_since_speech >= 4.0:
+                    cooldown = 3.0
+
+                should_speak = False
+                if has_changed:
+                    # Trigger immediately for new instructions if min gap met
+                    if time_since_speech >= 1.5:
                         should_speak = True
+                elif time_since_speech >= cooldown:
+                    # Forced periodic report (2-3s window)
+                    should_speak = True
 
                 if should_speak:
                     speaker.speak(current_text)
                     last_spoken_text = current_text
                     last_spoken_time = now
-                    # Print for user to see in logs
                     print(f"[NARRATION] ({current_priority}): {current_text}")
 
                 # 4. Draw & Display (Solid visuals)
@@ -228,27 +185,38 @@ def main():
                 cv2.rectangle(proc_frame, (0, 600), (640, 640), (0, 0, 0), -1)
                 cv2.putText(proc_frame, narrator.last_narration, (20, 625),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
                 cv2.imshow("ContextEye Video Test Client", proc_frame)
 
                 # Skip to next frame in video stream
                 frame_idx += frame_skip
+                
+                # 5. Timing Synchronization (Prevent Drift)
+                # target is 333ms per frame (3 FPS)
+                loop_elapsed_ms = int((time.time() - now) * 1000)
+                dynamic_delay = max(5, wait_delay - loop_elapsed_ms)
+                
+                # Print stats for user
+                if frame_idx % 10 == 0:
+                    print(f"[Sync] Latency: {loop_elapsed_ms/1000:.2f}s | FPS: {1000/max(5, loop_elapsed_ms):.1f}")
+                
+                key = cv2.waitKey(dynamic_delay) & 0xFF
+                if key == ord('q') or key == 27:
+                    break
+                elif key == ord('p'):
+                    paused = not paused
+                    print("[System] Paused" if paused else "[System] Resumed")
+                elif key == ord('r'):
+                    frame_idx = 0
+                    print("[System] Video Restarted")
+                
+                # Set next position
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-
-            # 5. UI Controls (synced to slideshow speed)
-            key = cv2.waitKey(wait_delay) & 0xFF
-            if key == ord('q') or key == 27:
-                break
-            elif key == ord('p'):
-                paused = not paused
-                print("[System] Paused" if paused else "[System] Resumed")
-            elif key == ord('r'):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                print("[System] Video Restarted")
 
     except KeyboardInterrupt:
         pass
     finally:
+        print("🎬 Session ended.")
+        speaker.speak("Navigation complete.")
         cap.release()
         cv2.destroyAllWindows()
 

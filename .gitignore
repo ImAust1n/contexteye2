@@ -1,0 +1,7 @@
+*.pt
+*.zip
+samples
+.venv
+finetuningStuffs
+__pycache__
+.env
